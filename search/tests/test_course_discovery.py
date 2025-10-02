@@ -3,75 +3,26 @@
 # error, but they do get used when included as part of the override_settings
 """ Tests for search functionalty """
 
-import copy
 import time
 from datetime import datetime
+import logging
 import ddt
 
 from django.core.cache import cache
 from django.test import TestCase
 from django.test.utils import override_settings
 from elasticsearch import Elasticsearch
+from meilisearch.errors import MeilisearchApiError
 
 from search.api import course_discovery_search, NoSearchEngineError
 from search.elastic import ElasticSearchEngine
+from search.tests.factories import DemoCourse
 from search.tests.utils import SearcherMixin, TEST_INDEX_NAME
 from search.meilisearch import get_meilisearch_client, create_indexes
 from .mock_search_engine import MockSearchEngine
 
 
-class DemoCourse:
-    """ Class for dispensing demo courses """
-    DEMO_COURSE_ID = "edX/DemoX/Demo_Course"
-    DEMO_COURSE = {
-        "start": datetime(2014, 2, 1),
-        "number": "DemoX",
-        "content": {
-            "short_description": "Short description",
-            "overview": "Long overview page",
-            "display_name": "edX Demonstration Course",
-            "number": "DemoX"
-        },
-        "course": "edX/DemoX/Demo_Course",
-        "image_url": "/c4x/edX/DemoX/asset/images_course_image.jpg",
-        "effort": "5:30",
-        "id": DEMO_COURSE_ID,
-        "enrollment_start": datetime(2014, 1, 1),
-    }
-
-    demo_course_count = 0
-
-    @classmethod
-    def get(cls, update_dict=None, remove_fields=None):
-        """ get a new demo course """
-        cls.demo_course_count += 1
-        course_copy = copy.deepcopy(cls.DEMO_COURSE)
-        if update_dict:
-            if "content" in update_dict:
-                course_copy["content"].update(update_dict["content"])
-                del update_dict["content"]
-            course_copy.update(update_dict)
-        course_copy.update({"id": "{}_{}".format(course_copy["id"], cls.demo_course_count)})
-        if remove_fields:
-            for remove_field in remove_fields:
-                if remove_field in course_copy:
-                    del course_copy[remove_field]
-        return course_copy
-
-    @classmethod
-    def reset_count(cls):
-        """ go back to zero """
-        cls.demo_course_count = 0
-
-    @staticmethod
-    def index(searcher, course_info):
-        """ Adds course info dictionary to the index """
-        searcher.index(sources=course_info)
-
-    @classmethod
-    def get_and_index(cls, searcher, update_dict=None, remove_fields=None):
-        """ Adds course info dictionary to the index """
-        cls.index(searcher, [cls.get(update_dict, remove_fields)])
+logger = logging.getLogger(__name__)
 
 
 @override_settings(SEARCH_ENGINE="search.tests.mock_search_engine.MockSearchEngine")
@@ -492,8 +443,17 @@ class TestMeilisearchCourseDiscoverySearch(TestCase, SearcherMixin):
     Integration tests using real Meilisearch engine.
     """
 
-    def setUp(self):
+    meilisearch_client = get_meilisearch_client()
+
+    def setUp(self):  # pragma: no cover
         super().setUp()
+        try:
+            self.meilisearch_client.index(TEST_INDEX_NAME).delete()
+        except MeilisearchApiError:
+            pass
+        except Exception as e:  # pylint: disable=broad-exception-caught
+            logger.warning(f"Unexpected error deleting Meilisearch index: {e}")
+
         create_indexes({TEST_INDEX_NAME: [
             "language",
             "modes",
@@ -504,18 +464,13 @@ class TestMeilisearchCourseDiscoverySearch(TestCase, SearcherMixin):
         ]})
         self.wait_for_meilisearch_indexing()
 
-    def tearDown(self):
-        client = get_meilisearch_client()
-        client.index(TEST_INDEX_NAME).delete()
-        super().tearDown()
-
-    @staticmethod
-    def wait_for_meilisearch_indexing():
+    def wait_for_meilisearch_indexing(self):  # pragma: no cover
         """Helper method adding a tiny delay for Meilisearch to finish updating the index."""
-        client = get_meilisearch_client()
-        task = client.index(TEST_INDEX_NAME).get_tasks().results[-1]
-        client.wait_for_task(task.uid)
-        time.sleep(0.2)
+        task = self.meilisearch_client.index(TEST_INDEX_NAME).get_tasks().results[-1]
+        if not task:
+            return
+        self.meilisearch_client.wait_for_task(task.uid)
+        time.sleep(0.1)
 
     def test_course_matching_empty_index(self):
         """ Check for empty result count before indexing """
